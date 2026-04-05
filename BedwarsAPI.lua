@@ -5,78 +5,128 @@
 ██╔══██╗██╔══██║╚██╗ ██╔╝██╔══╝  ██║╚██╗██║    ██╔══██╗╚════██║
 ██║  ██║██║  ██║ ╚████╔╝ ███████╗██║ ╚████║    ██████╔╝     ██║
 ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚══════╝╚═╝  ╚═══╝    ╚═════╝      ╚═╝
-Bedwars API - hooks into the game's internal controller system
+Bedwars API — hooks into the game's internal controller system
 ]]
 
-local Players = game:GetService("Players")
+local Players  = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
-local RunService = game:GetService("RunService")
 
 -- ============================================================
--- Controller Discovery
--- Bedwars uses a Flamework-style controller registry.
--- We find it via getgc() by looking for a table that contains
--- the known controller keys.
+-- Lazy Controller Discovery
+-- Controllers are found on first access, not at startup.
+-- All discovery is wrapped in pcall so a missing executor API
+-- (getgc, getsenv) never breaks the loader.
 -- ============================================================
 
-local function findControllers()
-    for _, v in ipairs(getgc(true)) do
-        if type(v) == "table"
-            and rawget(v, "SwordController") ~= nil
-            and rawget(v, "SprintController") ~= nil
-            and rawget(v, "KnockbackUtil") ~= nil
-        then
-            return v
-        end
+local _controllers = nil        -- raw game controller registry
+local _store       = nil        -- Rodux ClientHandlerStore
+
+-- Attempt 1: getgc scan — finds the live controller registry table
+local function tryGetgc()
+    local ok, gc = pcall(getgc, true)
+    if not ok or type(gc) ~= "table" then
+        -- Some executors use getgc() without the boolean arg
+        ok, gc = pcall(getgc)
     end
-end
+    if not ok or type(gc) ~= "table" then return nil, nil end
 
--- ClientHandlerStore is a Rodux store whose state has a .Bedwars key.
-local function findClientHandlerStore()
-    for _, v in ipairs(getgc(true)) do
-        if type(v) == "table"
-            and type(rawget(v, "getState")) == "function"
-            and type(rawget(v, "changed")) == "table"
-            and type(rawget(v, "changed").connect) == "function"
+    local ctrl, store = nil, nil
+    for _, v in ipairs(gc) do
+        if type(v) ~= "table" then continue end
+        -- Controller registry has at least these two keys
+        if not ctrl
+            and rawget(v, "SwordController")  ~= nil
+            and rawget(v, "SprintController") ~= nil
         then
-            local ok, state = pcall(function() return v:getState() end)
-            if ok and type(state) == "table" and state.Bedwars ~= nil then
-                return v
+            ctrl = v
+        end
+        -- Rodux store: has getState() and a .changed signal
+        if not store
+            and type(rawget(v, "getState")) == "function"
+            and type(rawget(v, "changed"))  == "table"
+        then
+            local ok2, state = pcall(function() return v:getState() end)
+            if ok2 and type(state) == "table" and state.Bedwars ~= nil then
+                store = v
             end
         end
+        if ctrl and store then break end
     end
+    return ctrl, store
 end
 
-local Controllers = nil
-local ClientHandlerStore = nil
-
--- Retry for up to 15 seconds
-for _ = 1, 30 do
-    Controllers = findControllers()
-    ClientHandlerStore = findClientHandlerStore()
-    if Controllers and ClientHandlerStore then break end
-    task.wait(0.5)
+-- Attempt 2: getsenv scan — walks every LocalScript environment
+local function tryGetsenv()
+    if not getsenv then return nil, nil end
+    local ctrl, store = nil, nil
+    local ok, scripts = pcall(function()
+        return LocalPlayer.PlayerScripts:GetDescendants()
+    end)
+    if not ok then return nil, nil end
+    for _, s in ipairs(scripts) do
+        if not s:IsA("LocalScript") then continue end
+        local eok, env = pcall(getsenv, s)
+        if not eok or type(env) ~= "table" then continue end
+        if not ctrl and type(env.controllers) == "table"
+            and env.controllers.SwordController ~= nil then
+            ctrl = env.controllers
+        end
+        if not store and type(env.ClientHandlerStore) == "table"
+            and type(env.ClientHandlerStore.getState) == "function" then
+            store = env.ClientHandlerStore
+        end
+        if ctrl and store then break end
+    end
+    return ctrl, store
 end
 
-if not Controllers then
-    warn("[RavenB4 API] Failed to locate game controllers")
-    Controllers = {}
-end
-
-if not ClientHandlerStore then
-    warn("[RavenB4 API] Failed to locate ClientHandlerStore")
-    -- Stub so the rest of the code doesn't error
+local function makeStubStore()
     local state = {Bedwars = {kit = "none"}, matchState = 0}
-    local subscribers = {}
-    ClientHandlerStore = {
+    local subs  = {}
+    return {
         getState = function() return state end,
-        changed = {
-            connect = function(_, fn) table.insert(subscribers, fn) end
+        changed  = {
+            connect = function(_, fn)
+                table.insert(subs, fn)
+            end
         }
     }
 end
 
-Controllers.ClientHandlerStore = ClientHandlerStore
+-- Resolve controllers on demand — tries each method once per call.
+local function resolveControllers()
+    if _controllers and _store then return end
+
+    local c, s = tryGetgc()
+    if not c or not s then
+        c2, s2 = tryGetsenv()
+        c = c or c2
+        s = s or s2
+    end
+
+    _controllers = c or {}
+    _store       = s or makeStubStore()
+    _controllers.ClientHandlerStore = _store
+end
+
+-- Proxy so callers always get the up-to-date controller table
+local Controllers = setmetatable({}, {
+    __index = function(_, key)
+        resolveControllers()
+        if key == "ClientHandlerStore" then return _store end
+        return _controllers[key]
+    end,
+    __newindex = function(_, key, value)
+        resolveControllers()
+        _controllers[key] = value
+    end,
+})
+
+-- Kick off a background resolution attempt immediately
+-- so controllers are usually ready by the time game code runs.
+task.defer(function()
+    resolveControllers()
+end)
 
 -- ============================================================
 -- Helpers
@@ -122,7 +172,7 @@ function Entity.getNearestEntity(maxDistance)
         local dist = (c.HumanoidRootPart.Position - origin).Magnitude
         if dist < nearestDist then
             nearestDist = dist
-            nearest = buildEntity(player)
+            nearest     = buildEntity(player)
         end
     end
     return nearest
@@ -185,7 +235,7 @@ end
 local Inventory = {}
 
 function Inventory.getSword()
-    -- Check equipped tool in character first
+    -- Equipped in character first
     local char = LocalPlayer.Character
     if char then
         for _, v in ipairs(char:GetChildren()) do
@@ -205,18 +255,16 @@ end
 
 function Inventory.equipItem(tool)
     if not tool or not tool:IsA("Tool") then return end
-    local humanoid = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-    if humanoid then
-        humanoid:EquipTool(tool)
-    end
+    local hum = LocalPlayer.Character
+        and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if hum then hum:EquipTool(tool) end
 end
 
 function Inventory.getItem(itemName)
-    -- Try the game's own InventoryController if available
-    if Controllers.InventoryController then
-        local ok, result = pcall(function()
-            return Controllers.InventoryController:getItem(itemName)
-        end)
+    -- Try game's own InventoryController
+    local inv = rawget(_controllers or {}, "InventoryController")
+    if inv then
+        local ok, result = pcall(function() return inv:getItem(itemName) end)
         if ok and result then return result end
     end
     -- Fallback: scan character and backpack
@@ -244,18 +292,14 @@ local Utility = {}
 
 -- 0 = lobby/waiting, 1 = in-game, 2 = game ended
 function Utility.getMatchState()
-    if Controllers.ClientHandlerStore then
-        local ok, state = pcall(function()
-            return Controllers.ClientHandlerStore:getState()
-        end)
-        if ok and state then
-            if state.matchState ~= nil then return state.matchState end
-            if state.Bedwars and state.Bedwars.matchState ~= nil then
-                return state.Bedwars.matchState
-            end
+    local store = _store or makeStubStore()
+    local ok, state = pcall(function() return store:getState() end)
+    if ok and state then
+        if state.matchState ~= nil then return state.matchState end
+        if state.Bedwars and state.Bedwars.matchState ~= nil then
+            return state.Bedwars.matchState
         end
     end
-    -- Rough fallback: if a Map/Bedwars folder exists, we're in a match
     if workspace:FindFirstChild("Map") or workspace:FindFirstChild("Bedwars") then
         return 1
     end
@@ -263,20 +307,17 @@ function Utility.getMatchState()
 end
 
 function Utility.getQueueType()
-    if Controllers.ClientHandlerStore then
-        local ok, state = pcall(function()
-            return Controllers.ClientHandlerStore:getState()
-        end)
-        if ok and state then
-            if state.queueType then return state.queueType end
-            if state.Lobby and state.Lobby.queueType then return state.Lobby.queueType end
-        end
+    local store = _store or makeStubStore()
+    local ok, state = pcall(function() return store:getState() end)
+    if ok and state then
+        if state.queueType then return state.queueType end
+        if state.Lobby and state.Lobby.queueType then return state.Lobby.queueType end
     end
     return "solos"
 end
 
 -- ============================================================
--- Return API
+-- Return API  (Controllers is a lazy proxy — never hangs startup)
 -- ============================================================
 
 return {
