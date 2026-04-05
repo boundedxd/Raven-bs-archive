@@ -528,6 +528,38 @@ blockCountLabel.TextColor3 = Color3.new(1, 1, 1)
 blockCountLabel.TextSize = 20
 blockCountLabel.Visible = false
 blockCountLabel.RichText = true
+local isExpandActive = false
+local expandWidth = 1
+
+local function placeScaffoldBlock(pos)
+    if store.blocks[pos] then return end
+    if not hasNeighbors(pos) then return end
+    local fakeBlock = Instance.new('Part')
+    fakeBlock.Name = 'TempBlock'
+    fakeBlock.Anchored = true
+    fakeBlock.Transparency = 1
+    fakeBlock.Size = Vector3.new(3, 3, 3)
+    fakeBlock.Position = pos
+    fakeBlock:AddTag('TempBlock')
+    fakeBlock:AddTag('Block')
+    fakeBlock.Parent = workspace.Map
+    bridgeduels.EffectsController:PlaySound(pos)
+    if not IsBlockdeleteenabled then
+        bridgeduels.Entity.LocalEntity:RemoveTool('Blocks', 1)
+    end
+    task.spawn(function()
+        local suc, block = bridgeduels.BlinkClient.item_action.place_block.invoke({
+            position = pos,
+            block_type = 'Clay',
+            extra = { rizz = "No", sigma = "The.", those = workspace.Name == "Ok" }
+        })
+        fakeBlock:Destroy()
+        if not (suc or block) and not IsBlockdeleteenabled then
+            bridgeduels.Entity.LocalEntity:RemoveTool('Blocks', 1)
+        end
+    end)
+end
+
 local loop = LoopManager.new()
 Scaffold = Blatant:CreateToggle({
     Name = "Scaffold",
@@ -597,6 +629,18 @@ Scaffold = Blatant:CreateToggle({
                                 end)
                             end
                         end
+                        -- Expand: place blocks left/right of player's facing direction
+                        if isExpandActive then
+                            local hrp = LocalPlayer.Character.HumanoidRootPart
+                            local rv = hrp.CFrame.RightVector
+                            local sideOffset = math.abs(rv.X) >= math.abs(rv.Z)
+                                and Vector3.new(3, 0, 0)
+                                or  Vector3.new(0, 0, 3)
+                            for i = 1, expandWidth do
+                                placeScaffoldBlock(targetPosition + sideOffset * i)
+                                placeScaffoldBlock(targetPosition - sideOffset * i)
+                            end
+                        end
                     else
                         isFirstRun = true
                         blockCountLabel.Visible = false
@@ -659,6 +703,21 @@ Scaffold:CreateSlider({
     Max = 40,
     Callback = function(Callback)
         towerSpeed = Callback
+    end
+})
+Scaffold:CreateToggle({
+    Name = "Expand",
+    Callback = function(Callback)
+        isExpandActive = Callback
+    end
+})
+Scaffold:CreateSlider({
+    Name = "Expand Width",
+    Default = 1,
+    Min = 1,
+    Max = 4,
+    Callback = function(Callback)
+        expandWidth = Callback
     end
 })
 local Breaker
@@ -1056,6 +1115,52 @@ NoSlow:CreateDropDown({ --made for later
 	Callback = function(Callback)
 	end
 })]]
+
+local noslowEat = false
+local noslowBlock = false
+local noslowConn = nil
+local noslowCharConn = nil
+
+local function connectNoslow(char)
+    if noslowConn then noslowConn:Disconnect() end
+    local hum = char:WaitForChild("Humanoid", 5)
+    if not hum then return end
+    noslowConn = hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+        if hum.WalkSpeed >= 16 then return end
+        if noslowEat or noslowBlock then
+            hum.WalkSpeed = 16
+        end
+    end)
+end
+
+NoSlow = Utility:CreateToggle({
+    Name = "No Slow",
+    Callback = function(Callback)
+        if Callback then
+            if LocalPlayer.Character then
+                connectNoslow(LocalPlayer.Character)
+            end
+            noslowCharConn = LocalPlayer.CharacterAdded:Connect(connectNoslow)
+        else
+            if noslowConn then noslowConn:Disconnect() noslowConn = nil end
+            if noslowCharConn then noslowCharConn:Disconnect() noslowCharConn = nil end
+        end
+    end
+})
+NoSlow:CreateToggle({
+    Name = "Eating",
+    StartingState = true,
+    Callback = function(Callback)
+        noslowEat = Callback
+    end
+})
+NoSlow:CreateToggle({
+    Name = "Blocking",
+    StartingState = true,
+    Callback = function(Callback)
+        noslowBlock = Callback
+    end
+})
 
 local old
 Nofall = Utility:CreateToggle({
